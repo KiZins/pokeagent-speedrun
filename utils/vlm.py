@@ -274,13 +274,13 @@ class OpenRouterBackend(VLMBackend):
         
         return result
 
-class LocalHuggingFaceBackend(VLMBackend):
-    """Local HuggingFace transformers backend with bitsandbytes optimization"""
+class GemLocalHuggingFaceBackend(VLMBackend):
+    """Gemma 3 Local HuggingFace transformers backend with bitsandbytes optimization"""
     
     def __init__(self, model_name: str, device: str = "auto", load_in_4bit: bool = False, **kwargs):
         try:
             import torch
-            from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
+            from transformers import AutoProcessor, BitsAndBytesConfig, Gemma3ForConditionalGeneration, BitsAndBytesConfig
             from PIL import Image
         except ImportError as e:
             raise ImportError(f"Required packages not found. Install with: pip install torch transformers bitsandbytes accelerate. Error: {e}")
@@ -305,14 +305,15 @@ class LocalHuggingFaceBackend(VLMBackend):
         # Load processor and model
         try:
             self.processor = AutoProcessor.from_pretrained(model_name)
-            self.model = AutoModelForImageTextToText.from_pretrained(
+
+            self.model = Gemma3ForConditionalGeneration.from_pretrained(
                 model_name,
                 quantization_config=quantization_config,
                 device_map=device if device != "auto" else "auto",
-                torch_dtype=torch.float16 if not load_in_4bit else None,
+                torch_dtype=torch.bfloat16 if not load_in_4bit else None,  # BF16 preferred
                 trust_remote_code=True
-            )
-            
+            ).eval()
+
             if device != "auto" and not load_in_4bit:
                 self.model = self.model.to(device)
                 
@@ -340,7 +341,167 @@ class LocalHuggingFaceBackend(VLMBackend):
                     device = self.model.module.device
                 else:
                     device = next(self.model.parameters()).device
+
+                inputs_on_device = {}
+                for k, v in inputs.items():
+                    if hasattr(v, 'to'):
+                        inputs_on_device[k] = v.to(device)
+                    else:
+                        inputs_on_device[k] = v
+
+                generated_ids = self.model.generate(
+                    **inputs_on_device,
+                    max_new_tokens=512,
+                    do_sample=True,
+                    temperature=0.7,
+                    #logits_processor=processors,
+                    pad_token_id=self.processor.tokenizer.eos_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id,
+                )
+
+                # Decode the response
+                generated_text = self.processor.decode(generated_ids[0], skip_special_tokens=True)
+
+                # Extract only the generated part (remove the prompt)
+                if text in generated_text:
+                    result = generated_text.split(text)[-1].strip()
+                else:
+                    result = generated_text.strip()
+            print(result)
+            # Log the interaction
+            duration = time.time() - start_time
+            log_llm_interaction(
+                interaction_type=f"local_{module_name}",
+                prompt=text,
+                response=result,
+                duration=duration,
+                metadata={"model": self.model_name, "backend": "local", "has_image": "images" in inputs},
+                model_info={"model": self.model_name, "backend": "local"}
+            )
+            
+            # Log the response
+            result_preview = result[:1000] + "..." if len(result) > 1000 else result
+            logger.info(f"[{module_name}] RESPONSE: {result_preview}")
+            logger.info(f"[{module_name}] ---")
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            raise
+    
+    def get_query(self, img: Union[Image.Image, np.ndarray], text: str, module_name: str = "Unknown") -> str:
+        """Process an image and text prompt using local HuggingFace model"""
+        # Handle both PIL Images and numpy arrays
+        if hasattr(img, 'convert'):  # It's a PIL Image
+            image = img
+        elif hasattr(img, 'shape'):  # It's a numpy array
+            image = Image.fromarray(img)
+        else:
+            raise ValueError(f"Unsupported image type: {type(img)}")
+        
+        # Prepare messages with proper chat template format
+        messages = [
+            {"role": "user",
+             "content": [
+                 {"type": "image", "image": image},
+                 {"type": "text", "text": text}
+             ]}
+        ]
+        formatted_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=formatted_text, images=image, return_tensors="pt")
+        
+        return self._generate_response(inputs, text, module_name)
+    
+    def get_text_query(self, text: str, module_name: str = "Unknown") -> str:
+        """Process a text-only prompt using local HuggingFace model"""
+        # For text-only queries, use simple text format without image
+        messages = [
+            {"role": "user", "content": text}
+        ]
+        formatted_text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(text=formatted_text, return_tensors="pt")
+        
+        return self._generate_response(inputs, text, module_name) 
+
+class LocalHuggingFaceBackend(VLMBackend):
+    """Local HuggingFace transformers backend with bitsandbytes optimization"""
+    
+    def __init__(self, model_name: str, device: str = "auto", load_in_4bit: bool = False, **kwargs):
+        try:
+            import torch
+            from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig, Gemma3ForConditionalGeneration, BitsAndBytesConfig
+            from PIL import Image
+        except ImportError as e:
+            raise ImportError(f"Required packages not found. Install with: pip install torch transformers bitsandbytes accelerate. Error: {e}")
+        
+        self.model_name = model_name
+        self.device = device
+        self.torch = torch
+        
+        logger.info(f"Loading local VLM model: {model_name}")
+        
+        # Configure quantization if requested
+        quantization_config = None
+        if load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+            logger.info("Using 4-bit quantization with bitsandbytes")
+        
+        # Load processor and model
+        try:
+            #self.processor = AutoProcessor.from_pretrained(model_name)
+            #self.model = AutoModelForImageTextToText.from_pretrained(
+            #    model_name,
+            #    quantization_config=quantization_config,
+            #    device_map=device if device != "auto" else "auto",
+            #    torch_dtype=torch.float16 if not load_in_4bit else None,
+            #    trust_remote_code=True
+            #)
+            self.processor = AutoProcessor.from_pretrained(model_name)
+
+            self.model = Gemma3ForConditionalGeneration.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map=device if device != "auto" else "auto",
+                torch_dtype=torch.bfloat16 if not load_in_4bit else None,  # BF16 preferred
+                trust_remote_code=True
+            ).eval()
+            if device != "auto" and not load_in_4bit:
+                self.model = self.model.to(device)
                 
+            logger.info(f"Model loaded successfully on {device}")
+            
+        except Exception as e:
+            logger.error(f"Failed to load model {model_name}: {e}")
+            raise
+    
+    def _generate_response(self, inputs: Dict[str, Any], text: str, module_name: str) -> str:
+        """Generate response using the local model"""
+        try:
+            start_time = time.time()
+            
+            # Log the prompt
+            prompt_preview = text[:2000] + "..." if len(text) > 2000 else text
+            logger.info(f"[{module_name}] LOCAL HF VLM QUERY:")
+            logger.info(f"[{module_name}] PROMPT: {prompt_preview}")
+            
+            with self.torch.no_grad():
+                # Ensure all inputs are on the correct device
+                if hasattr(self.model, 'device'):
+                    device = self.model.device
+                elif hasattr(self.model, 'module') and hasattr(self.model.module, 'device'):
+                    device = self.model.module.device
+                else:
+                    device = next(self.model.parameters()).device
+                #print("T++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                #print("Test point 1")
                 # Move inputs to device if needed
                 inputs_on_device = {}
                 for k, v in inputs.items():
@@ -348,7 +509,8 @@ class LocalHuggingFaceBackend(VLMBackend):
                         inputs_on_device[k] = v.to(device)
                     else:
                         inputs_on_device[k] = v
-                
+                #print("T++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                #print("Test point 2")
                 generated_ids = self.model.generate(
                     **inputs_on_device,
                     max_new_tokens=1024,
@@ -356,10 +518,12 @@ class LocalHuggingFaceBackend(VLMBackend):
                     temperature=0.7,
                     pad_token_id=self.processor.tokenizer.eos_token_id
                 )
-                
+                print("T++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                print("Test point 3")
                 # Decode the response
                 generated_text = self.processor.decode(generated_ids[0], skip_special_tokens=True)
-                
+                print("T++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+                print("Test point 4")
                 # Extract only the generated part (remove the prompt)
                 if text in generated_text:
                     result = generated_text.split(text)[-1].strip()
@@ -815,6 +979,7 @@ class VLM:
         'openai': OpenAIBackend,
         'openrouter': OpenRouterBackend,
         'local': LocalHuggingFaceBackend,
+        'local-gem': GemLocalHuggingFaceBackend,
         'gemini': GeminiBackend,
         'ollama': LegacyOllamaBackend,  # Legacy support
         'vertex': VertexBackend,  # Added Vertex backend
